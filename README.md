@@ -1,102 +1,139 @@
-# Section B — Wikipedia Retrieval Pipeline
+# Hybrid retrieval over a Wikipedia corpus
 
 **Authors:** Daniel Kats (207730854) · Noga Nagel (322586082)
 
-End-to-end retrieval over ~27,000 Wikipedia-style pages. For each query,
-`run(queries)` returns a ranked list of `page_id`s, scored by mean **NDCG@10**.
+This project answers a search query by returning the `page_id`s of the Wikipedia
+entries most likely to be relevant, ordered best-first. Quality is measured with
+mean **NDCG@10** over a held-out query set. The corpus has ~27,000 pages; a query
+may have several correct answers.
 
-**Method in one line:** page-level BM25 proposes candidates, reciprocal rank
-fusion of three signals (page-dense cosine, BM25, chunk-dense max-pooled to page)
-ranks them, and a cross-encoder reranks the top candidates — *blended* with the
-fusion score rather than replacing it.
+The system is split in two: an **offline build** that turns the corpus into a few
+compact files, and a **fast online lookup** that the grader calls. Only the lookup
+is timed, and it never rebuilds anything — it just reads what the build produced.
 
-## Pipeline
+---
 
-| stage | file | what it does |
-|-------|------|--------------|
-| chunk | `chunk.py` | Split each page into title-prefixed overlapping word windows (`TARGET_WORDS=180`, `OVERLAP_WORDS=40`) so a long page is not blurred into one vector. |
-| embed | `embed.py` | `sentence-transformers/all-MiniLM-L6-v2`, L2-normalized 384-d vectors (inner product = cosine). |
-| index | `index.py` | Offline build of all retrieval artifacts (PQ chunk index, page vectors, page-level BM25, page texts). |
-| retrieve | `retrieve.py` | Query-time hybrid retrieval + cross-encoder rerank (the timed path). |
+## Running it
 
-### Retrieval detail (`retrieve.py`)
-
-1. **Candidates** — top `LEX_POOL=100` pages by page-level BM25 (falls back to
-   page-dense if a query has no lexical hit), widened with the best pages from
-   the chunk index.
-2. **Fusion** — reciprocal rank fusion (`RRF_K=60`) of the three signals
-   (page-dense cosine, BM25, best-passage cosine). RRF blends by rank position,
-   so it needs no per-signal weights — nothing to overfit on the public set.
-3. **Cross-encoder rerank** — the top `RERANK_DEPTH=12` are scored by
-   `cross-encoder/ms-marco-MiniLM-L-6-v2` and **blended** with the fusion score
-   (`RERANK_WEIGHT=0.85·CE + 0.15·fusion`). Blending (vs. letting the CE fully
-   replace the fusion order) was more robust in our experiments. If the
-   cross-encoder cannot be loaded at runtime, retrieval falls back to the fusion
-   ranking instead of failing.
-
-## Artifacts (`artifacts/`, loaded by `run()` — never rebuilt at grading)
-
-| file | content | format |
-|------|---------|--------|
-| `chunk.faiss` | chunk-level dense vectors, product-quantized | FAISS `IndexPQ` (m=96), ~42 MB |
-| `chunk_pages.npy` | chunk-row → page_id map | int32 `(num_chunks,)` |
-| `page_vecs.npy` | one dense vector per page | float32 `(num_pages, 384)` |
-| `page_ids.npy` | page_ids aligned to `page_vecs.npy` / BM25 rows | int64 `(num_pages,)` |
-| `page_texts.json` | per-page title+content (≤400 words), cross-encoder input | JSON list |
-| `bm25.npz` | page-level BM25 postings (precomputed weights, CSR-by-term) | npz |
-| `bm25_vocab.json` | term → term_id map | JSON |
-| `meta.json` | build counts and parameters | JSON |
-
-**No Git LFS required** — every artifact is under 100 MB (the chunk index is
-product-quantized for exactly this reason), so a plain `git clone` yields a
-ready-to-run repo.
-
-## Setup
+Dependencies (NumPy, sentence-transformers, FAISS):
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Pretrained MiniLM / cross-encoder weights are downloaded from the Hugging Face
-hub on first use; they are not shipped in the repo.
-
-## Run the public self-test (no rebuild needed)
-
-A fresh clone already contains `artifacts/`, so the evaluation runs directly:
+Then evaluate on the public queries — the prebuilt index is already in the repo,
+so no rebuild is needed:
 
 ```bash
-python scripts/eval_public.py        # prints mean NDCG@10 on the public queries
+python scripts/eval_public.py
 ```
 
-## Rebuild the index (offline, only on your own machine — not timed, not run by staff)
+This prints mean NDCG@10. (MiniLM and the reranker weights download from the
+Hugging Face hub the first time they are used.)
 
-The corpus (`data/Wikipedia Entries/`) is **not** committed (it is part of the
-course handout and is not needed at query time). To rebuild artifacts from
-scratch, place the corpus there and run:
+---
+
+## What the timed lookup does (`main.run` → `retrieve.py`)
+
+For one batch of queries:
+
+1. **Encode** each query with MiniLM into the shared 384-d space.
+2. **Three relevance scores per page** are computed: a whole-page cosine, a
+   keyword **BM25** score, and the cosine of the page's single best-matching
+   *passage* (pulled from the passage index).
+3. **A short candidate list** is formed from the strongest BM25 pages (or the
+   strongest dense pages when a query has no keyword overlap), plus any page that
+   owns a high-scoring passage.
+4. **The three scores are merged with reciprocal rank fusion** — each score votes
+   for a page by its *rank*, and the votes are summed. Because it works on ranks,
+   there are no blending weights to tune (and therefore none to overfit).
+5. **A cross-encoder re-reads the top 12** query-page pairs jointly and its score
+   is mixed 0.85 / 0.15 with the fusion score. If the reranker can't be loaded,
+   the fusion order is used as-is rather than failing.
+6. The de-duplicated ranking is returned (the grader reads the first 10).
+
+## What the offline build does (`scripts/build_index.py` → `index.py`)
+
+Run once on a full machine; the resulting `artifacts/` are committed.
+
+- **Passages.** Each page is sliced into overlapping ~180-word windows (40-word
+  overlap) with the page title repeated on every window, so a query can match a
+  specific paragraph instead of an averaged-out whole page (`chunk.py`).
+- **Vectors.** Passages and pages are encoded with
+  `sentence-transformers/all-MiniLM-L6-v2`, L2-normalized so a dot product is a
+  cosine (`embed.py`).
+- **Three stored signals.** A **product-quantized** FAISS index over the passage
+  vectors, one dense vector per page, and a page-level BM25 model whose posting
+  weights are pre-computed so query scoring is a plain sum.
+
+The passage index is product-quantized on purpose: a flat float32 index is
+~670 MB, but the quantized one is ~42 MB at the same retrieval quality. That keeps
+**every file under 100 MB, so the repository needs no Git LFS** and clones ready
+to run.
+
+---
+
+## Files under `artifacts/`
+
+| file | holds | used for |
+|------|-------|----------|
+| `chunk.faiss` | passage vectors, product-quantized (`IndexPQ`, ~42 MB) | passage cosine signal |
+| `chunk_pages.npy` | passage-row → page_id | mapping passages back to pages |
+| `page_vecs.npy` | one 384-d vector per page | whole-page cosine signal |
+| `page_ids.npy` | page_ids aligned to the rows above | output ids / BM25 rows |
+| `bm25.npz` | BM25 postings with weights baked in | keyword signal |
+| `bm25_vocab.json` | term → id | BM25 lookup |
+| `page_texts.json` | page title+text (≤400 words) | cross-encoder input |
+| `meta.json` | sizes and build parameters | reference |
+
+---
+
+## Rebuilding from the raw corpus (optional)
+
+The corpus folder `data/Wikipedia Entries/` is **not** in the repo — it is course
+input data and the lookup never reads it (it reads `artifacts/`). To regenerate
+the artifacts, drop the corpus into that folder and run:
 
 ```bash
-python scripts/build_index.py        # embeds the corpus and writes artifacts/
+python scripts/build_index.py
 ```
 
-## Empirical results (public queries)
+---
 
-Mean NDCG@10 on the public set, measured with `scripts/ablation.py` /
-`scripts/sweep.py`:
+## Why these choices (decided by measurement)
 
-| configuration | NDCG@10 |
+On the public set, mean NDCG@10 grew as:
+
+| version | NDCG@10 |
 |---|---|
-| dense only | 0.369 |
-| − cross-encoder | 0.383 |
-| − chunk channel | 0.381 |
-| full pipeline, weighted min-max fusion | 0.445 |
-| full pipeline, reciprocal rank fusion | **0.448** |
+| dense vectors only | 0.369 |
+| hybrid without the reranker | 0.383 |
+| hybrid without the passage signal | 0.381 |
+| full system, weight-tuned fusion | 0.445 |
+| **full system, reciprocal rank fusion** | **0.448** |
 
-Each channel contributes: removing the cross-encoder or the chunk channel each
-costs ~0.05 NDCG. Reciprocal rank fusion edged out a tuned weighted blend while
-needing no weights to tune. The product-quantized chunk index matches the flat
-index's quality at ~1/15th the size. The full query batch runs in a few seconds
-(well under the 60 s limit).
+Dropping either the reranker or the passage signal costs about 0.05 each, so both
+stay. Rank fusion beat a hand-tuned weighted blend while removing the tunable
+weights, which should transfer better to unseen queries. Single-answer queries
+score ~0.77; multi-answer queries are the hard part (~0.22), where the limit is
+fitting many correct pages into the top 10. The whole batch runs in a few seconds,
+far inside the 60-second budget.
 
-## Video
+## Files in this repo
 
-Presentation (≤ 3 min): https://youtu.be/zI6FRaDmKSE
+```
+main.py            run(queries) entry point + offline build hook
+chunk.py           page → overlapping passages
+embed.py           MiniLM encoder (shared by build and query)
+index.py           build + load of the on-disk signals
+retrieve.py        the timed lookup (fusion + rerank)
+runtime.py         OpenMP guard so FAISS and torch coexist safely
+utils.py           paths and corpus/query helpers
+eval.py            NDCG@10 scoring (course file, unmodified)
+scripts/           eval_public.py, build_index.py (course files)
+artifacts/         the committed prebuilt index
+```
+
+## Presentation
+
+Video (≤ 3 min): https://youtu.be/zI6FRaDmKSE
