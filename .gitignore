@@ -1,0 +1,11 @@
+# Corpus is provided by the course handout; not needed at query time (run() loads
+# only artifacts/). Excluded to keep the repo lean. See README.
+data/Wikipedia Entries/
+
+# Local dev-only sweep outputs
+artifacts-dev/
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
