@@ -1,4 +1,9 @@
-"""Shared paths and helpers for Section B."""
+"""Project-wide paths, constants, and small corpus/query helpers.
+
+Everything here is import-only plumbing shared by the build, the retriever, and
+the read-only evaluation harness: where files live, the embedding model name, the
+evaluation cutoff, and the readers that turn the on-disk JSON into records.
+"""
 from __future__ import annotations
 
 import json
@@ -25,6 +30,7 @@ def normalize_page_id(value: Any) -> int:
 
 
 def load_public_queries(path: Path | None = None) -> List[Dict[str, Any]]:
+    """Read the public query file, normalizing each relevant id list to ints."""
     path = path or PUBLIC_QUERIES_PATH
     rows = json.loads(path.read_text(encoding="utf-8"))
     for row in rows:
@@ -49,6 +55,7 @@ def iter_entries(entries_dir: Path | None = None) -> Iterator[Dict[str, Any]]:
 
 
 def entry_text(record: Dict[str, Any]) -> str:
+    """Join a page's title and body into one string the encoders consume."""
     title = record.get("title", "")
     content = record.get("content", "")
     if title:
@@ -57,5 +64,6 @@ def entry_text(record: Dict[str, Any]) -> str:
 
 
 def ensure_artifacts_dir() -> Path:
+    """Create the artifacts directory if missing and return its path."""
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     return ARTIFACTS_DIR

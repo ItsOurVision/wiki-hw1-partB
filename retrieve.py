@@ -1,164 +1,165 @@
-"""Query-time retrieval (timed path; includes query embedding).
+"""Query-time ranking — the only timed code path.
 
-For each query:
-  1. take the top `CAND_M` pages by BM25 (fall back to dense if no lexical hit),
-     widened with the best pages from the chunk index;
-  2. fuse three min-max-normalized signals over those candidates --
-     page-dense cosine, BM25, and chunk-dense (max-pooled to page);
-  3. rerank the top `CE_TOPK` with a cross-encoder, blended with the fusion
-     score so a noisy CE cannot bury an already well-ranked page.
+A :class:`HybridRanker` holds the loaded artifacts and ranks each query in four
+steps:
 
-The cross-encoder is optional at runtime: if it cannot be loaded (e.g. no hub
-access on the grading box) retrieval falls back to the fusion ranking instead of
-failing. Artifacts and models load once and are cached across the batch.
+1. score every page by lexical BM25 and by dense cosine, and pull the best
+   passage cosine per page from the FAISS index;
+2. assemble a candidate pool (BM25 leaders, with a dense fallback, widened by the
+   pages that own strong passages);
+3. fuse the three signals over that pool with min-max normalization and fixed
+   weights;
+4. rerank the very top of the pool with a cross-encoder, mixed with the fusion
+   score so a confident-but-wrong reranker cannot sink an already-good page.
+
+If the cross-encoder cannot be instantiated (e.g. no model download is possible),
+ranking silently degrades to the fusion order rather than erroring. The ranker and
+its artifacts are built once and reused for the whole batch.
 """
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Dict, List, Optional
+import runtime  # noqa: F401  - installs the OpenMP guard before faiss/torch import
 
-import runtime  # noqa: F401  # sets OpenMP guard before faiss/torch load
+from typing import Dict, List, Optional
+from pathlib import Path
+
 import numpy as np
 
-from embed import embed_queries
-from index import load_chunk_index, load_hybrid, tokenize
+from embed import encode_queries
+from index import CorpusIndex, load_index, term_tokens
 
-# --- tunable config (selected by the offline sweep; see README) --------------
-CAND_M = 100                             # BM25 candidate pages fed to fusion
-CHUNK_TOPN = 256                         # chunks pulled per query before max-pool
-RETURN_K = 50                            # pages returned (only first 10 scored)
-W_DENSE, W_BM25, W_CHUNK = 0.2, 0.5, 0.3  # linear fusion weights (offline sweep)
-CE_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-CE_TOPK = 12                             # candidates reranked by the cross-encoder
-W_CE = 0.85                              # CE share in the rerank blend
-
-_H: Optional[Dict] = None
-_CHUNK = None
-_PID2ROW: Optional[Dict[int, int]] = None
-_CE = None
-_CE_FAILED = False
+# ---- ranking configuration (values fixed by the offline sweeps) -------------
+LEX_POOL = 100               # BM25 leaders taken as candidates
+PASSAGE_POOL = 256           # passages fetched per query before pooling to pages
+RESULT_DEPTH = 50            # pages emitted per query (grader scores the first 10)
+WEIGHT_DENSE = 0.2           # fusion weight: whole-page cosine
+WEIGHT_LEX = 0.5             # fusion weight: BM25
+WEIGHT_PASSAGE = 0.3         # fusion weight: best-passage cosine
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+RERANK_DEPTH = 12            # how many pool leaders the cross-encoder rescoring sees
+RERANK_WEIGHT = 0.85         # cross-encoder share when mixed with the fusion score
 
 
-def _hybrid(artifacts_dir: Optional[Path]) -> Dict:
-    global _H, _PID2ROW
-    if _H is None:
-        _H = load_hybrid(artifacts_dir)
-        _PID2ROW = {pid: i for i, pid in enumerate(_H["page_ids"])}
-    return _H
+def _unit_scale(values: np.ndarray) -> np.ndarray:
+    """Min-max a score vector into [0, 1]; a constant vector collapses to zeros."""
+    if values.size == 0:
+        return values
+    low = float(values.min())
+    span = float(values.max()) - low
+    return (values - low) / span if span > 1e-12 else np.zeros_like(values)
 
 
-def _chunk(artifacts_dir: Optional[Path]):
-    global _CHUNK
-    if _CHUNK is None:
-        _CHUNK = load_chunk_index(artifacts_dir)
-    return _CHUNK
+class HybridRanker:
+    """Ranks queries against a loaded :class:`CorpusIndex`."""
+
+    def __init__(self, index: CorpusIndex):
+        self.ix = index
+        self._reranker = None
+        self._reranker_off = False
+
+    # -- individual signals ---------------------------------------------------
+    def _lexical_scores(self, tokens: List[str]) -> np.ndarray:
+        scores = np.zeros(len(self.ix.page_ids), dtype=np.float32)
+        ptr, pages, weights = self.ix.lex_ptr, self.ix.lex_pages, self.ix.lex_weights
+        for token in tokens:
+            tid = self.ix.vocab.get(token)
+            if tid is None:
+                continue
+            start, stop = int(ptr[tid]), int(ptr[tid + 1])
+            if stop > start:                       # each term lists every page once
+                scores[pages[start:stop]] += weights[start:stop]
+        return scores
+
+    def _best_passage(self, qvec: np.ndarray) -> Dict[int, float]:
+        depth = min(PASSAGE_POOL, self.ix.passages.ntotal)
+        if depth == 0:
+            return {}
+        sims, rows = self.ix.passages.search(qvec[None, :], depth)
+        owner, best = self.ix.passage_owner, {}
+        for sim, row in zip(sims[0], rows[0]):
+            if row < 0:
+                continue
+            pid = int(owner[row])
+            if sim > best.get(pid, -1e9):
+                best[pid] = float(sim)
+        return best
+
+    def _reranker_model(self):
+        if self._reranker is None and not self._reranker_off:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._reranker = CrossEncoder(RERANK_MODEL)
+            except Exception as exc:  # pragma: no cover - depends on environment
+                print(f"[retrieve] cross-encoder unavailable ({exc}); fusion-only ranking")
+                self._reranker_off = True
+        return self._reranker
+
+    # -- per-query ranking ----------------------------------------------------
+    def _candidate_pool(self, dense: np.ndarray, lex: np.ndarray,
+                        passage: Dict[int, float]) -> np.ndarray:
+        pool = np.argsort(-lex)[:LEX_POOL]
+        if not bool((lex[pool] > 0).any()):        # query had no lexical overlap
+            pool = np.argsort(-dense)[:LEX_POOL]
+        owners = [self.ix.row_of[p] for p in passage if p in self.ix.row_of]
+        if owners:
+            pool = np.union1d(pool, np.asarray(owners, dtype=pool.dtype))
+        return pool
+
+    def rank_query(self, text: str, qvec: np.ndarray) -> List[int]:
+        ix = self.ix
+        with np.errstate(all="ignore"):            # silence macOS Accelerate FP noise
+            dense = ix.page_matrix @ qvec
+        lex = self._lexical_scores(term_tokens(text))
+        passage = self._best_passage(qvec)
+
+        pool = self._candidate_pool(dense, lex, passage)
+        passage_col = np.fromiter(
+            (passage.get(ix.page_ids[int(r)], 0.0) for r in pool),
+            dtype=np.float32, count=pool.size)
+        fused = (WEIGHT_DENSE * _unit_scale(dense[pool])
+                 + WEIGHT_LEX * _unit_scale(lex[pool])
+                 + WEIGHT_PASSAGE * _unit_scale(passage_col))
+        ordering = np.argsort(-fused)
+        ranked = pool[ordering]
+        fused_desc = fused[ordering]
+
+        model = self._reranker_model()
+        if model is not None and ranked.size:
+            depth = min(RERANK_DEPTH, ranked.size)
+            head = ranked[:depth]
+            pairs = [(text, ix.page_text[int(r)]) for r in head]
+            try:
+                ce = np.asarray(model.predict(pairs, show_progress_bar=False))
+                mixed = RERANK_WEIGHT * _unit_scale(ce) + (1.0 - RERANK_WEIGHT) * _unit_scale(fused_desc[:depth])
+                ranked = np.concatenate([head[np.argsort(-mixed)], ranked[depth:]])
+            except Exception as exc:  # pragma: no cover
+                print(f"[retrieve] rerank skipped ({exc}); fusion order kept")
+
+        out: List[int] = []
+        emitted = set()
+        for row in ranked:
+            pid = ix.page_ids[int(row)]
+            if pid not in emitted:
+                emitted.add(pid)
+                out.append(pid)
+            if len(out) >= RESULT_DEPTH:
+                break
+        return out
+
+    def rank_batch(self, queries: List[str]) -> List[List[int]]:
+        qvecs = encode_queries(queries)
+        if qvecs.size == 0:
+            return [[] for _ in queries]
+        qvecs = np.ascontiguousarray(qvecs, dtype=np.float32)
+        return [self.rank_query(queries[i], qvecs[i]) for i in range(len(queries))]
 
 
-def _cross_encoder():
-    """Load the CE once. Returns None (permanently) if it cannot be loaded."""
-    global _CE, _CE_FAILED
-    if _CE is None and not _CE_FAILED:
-        try:
-            from sentence_transformers import CrossEncoder
-            _CE = CrossEncoder(CE_MODEL)
-        except Exception as exc:  # pragma: no cover - environment dependent
-            print(f"[retrieve] cross-encoder unavailable, using fusion only: {exc}")
-            _CE_FAILED = True
-    return _CE
-
-
-def _minmax(x: np.ndarray) -> np.ndarray:
-    """Scale to [0, 1]; a flat vector maps to zeros."""
-    if x.size == 0:
-        return x
-    lo, hi = float(x.min()), float(x.max())
-    return np.zeros_like(x) if hi - lo < 1e-12 else (x - lo) / (hi - lo)
-
-
-def _bm25_scores(tokens: List[str], h: Dict) -> np.ndarray:
-    """Page BM25 via gather + scatter-add over precomputed posting weights."""
-    scores = np.zeros(len(h["page_ids"]), dtype=np.float32)
-    vocab, ptr, pages, wts = h["vocab"], h["term_ptr"], h["post_pages"], h["post_weights"]
-    for tok in tokens:
-        tid = vocab.get(tok)
-        if tid is None:
-            continue
-        a, b = int(ptr[tid]), int(ptr[tid + 1])
-        if b > a:
-            np.add.at(scores, pages[a:b], wts[a:b])
-    return scores
-
-
-def _chunk_page_scores(qvec: np.ndarray, artifacts_dir: Optional[Path]) -> Dict[int, float]:
-    """Best chunk-dense cosine per page for one query."""
-    index, chunk_pages = _chunk(artifacts_dir)
-    n = min(CHUNK_TOPN, index.ntotal)
-    if n == 0:
-        return {}
-    sims, rows = index.search(qvec[None, :], n)
-    best: Dict[int, float] = {}
-    for s, row in zip(sims[0], rows[0]):
-        if row < 0:
-            continue
-        pid = int(chunk_pages[int(row)])
-        if s > best.get(pid, -1e9):
-            best[pid] = float(s)
-    return best
-
-
-def _rank_one(query: str, qvec: np.ndarray, h: Dict, artifacts_dir: Optional[Path]) -> List[int]:
-    page_ids = h["page_ids"]
-    # The matmul triggers spurious FP warnings on macOS Accelerate (numpy 2.x);
-    # scores are correct, so we silence them here.
-    with np.errstate(all="ignore"):
-        dense_all = h["page_vecs"] @ qvec
-    bm25_all = _bm25_scores(tokenize(query), h)
-    chunk_best = _chunk_page_scores(qvec, artifacts_dir)
-
-    # candidate set: BM25 top-M (or dense fallback), widened by chunk winners
-    cand = np.argsort(-bm25_all)[:CAND_M]
-    if int((bm25_all[cand] > 0).sum()) == 0:
-        cand = np.argsort(-dense_all)[:CAND_M]
-    crows = [_PID2ROW[p] for p in chunk_best if p in _PID2ROW]
-    if crows:
-        cand = np.union1d(cand, np.array(crows, dtype=cand.dtype))
-
-    chunk_vec = np.array([chunk_best.get(page_ids[int(r)], 0.0) for r in cand], dtype=np.float32)
-    fused = (W_DENSE * _minmax(dense_all[cand])
-             + W_BM25 * _minmax(bm25_all[cand])
-             + W_CHUNK * _minmax(chunk_vec))
-    order = cand[np.argsort(-fused)]
-    fused_sorted = np.sort(fused)[::-1]
-
-    # cross-encoder rerank of the head, blended with fusion
-    ce = _cross_encoder()
-    if ce is not None and len(order):
-        k = min(CE_TOPK, len(order))
-        head = order[:k]
-        pairs = [(query, h["page_texts"][int(r)]) for r in head]
-        try:
-            ce_scores = np.asarray(ce.predict(pairs, show_progress_bar=False))
-            blended = W_CE * _minmax(ce_scores) + (1.0 - W_CE) * _minmax(fused_sorted[:k])
-            order = np.concatenate([head[np.argsort(-blended)], order[k:]])
-        except Exception as exc:  # pragma: no cover
-            print(f"[retrieve] CE predict failed, fusion only: {exc}")
-
-    out, seen = [], set()
-    for r in order:
-        pid = page_ids[int(r)]
-        if pid not in seen:
-            seen.add(pid)
-            out.append(pid)
-        if len(out) >= RETURN_K:
-            break
-    return out
+_RANKER: Optional[HybridRanker] = None
 
 
 def search_batch(queries: List[str], *, artifacts_dir: Optional[Path] = None) -> List[List[int]]:
-    """One ranked list of page_id (best first) per query."""
-    h = _hybrid(artifacts_dir)
-    qvecs = embed_queries(queries)
-    if qvecs.size == 0:
-        return [[] for _ in queries]
-    qvecs = np.ascontiguousarray(qvecs, dtype=np.float32)
-    return [_rank_one(queries[i], qvecs[i], h, artifacts_dir) for i in range(len(queries))]
+    """Rank every query; returns one best-first list of page_id per query."""
+    global _RANKER
+    if _RANKER is None:
+        _RANKER = HybridRanker(load_index(artifacts_dir))
+    return _RANKER.rank_batch(queries)

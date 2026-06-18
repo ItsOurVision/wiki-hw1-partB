@@ -1,184 +1,192 @@
-"""Offline index build and load.
+"""Offline construction and loading of the on-disk search structures.
 
-The build (untimed) writes three retrieval signals to `artifacts/`:
+Run once on a full machine, the build writes four complementary signals into
+``artifacts/`` and never runs again at query time:
 
-  chunk.faiss / chunk_pages.npy   dense FAISS over overlapping windows
-                                  + the chunk-row -> page_id map
-  page_vecs.npy / page_ids.npy    one dense vector per page (page channel)
-  bm25.npz / bm25_vocab.json      page-level BM25 with posting weights baked in
-  page_texts.json                 per-page text aligned to page_ids (cross-encoder)
-  meta.json                       counts + build parameters
+* a product-quantized FAISS index over passage vectors (the passage signal),
+* one dense vector per page plus the page texts (the page + rerank signals),
+* a page-level BM25 model with its posting weights pre-multiplied (the lexical
+  signal).
 
-`run()` only ever *loads* these; it never rebuilds. FAISS is (de)serialized
-through Python bytes so non-ASCII artifact paths work everywhere.
+Loading hydrates a single :class:`CorpusIndex` that the retriever queries. The
+passage index is product-quantized so it stays a few tens of MB on disk instead
+of hundreds, which lets the whole ``artifacts/`` folder ship in a normal git
+repository.
 """
 from __future__ import annotations
 
-import json
-import math
-import re
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import runtime  # noqa: F401  - installs the OpenMP guard before faiss is imported
 
-import runtime  # noqa: F401  # sets OpenMP guard before faiss/torch load
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import faiss
 import numpy as np
 
-faiss.omp_set_num_threads(1)  # avoid faiss<->torch OpenMP races at query time
-
-from chunk import Chunk, chunk_corpus
-from embed import EMBED_DIM, embed_texts
+from chunk import Passage, passages_of
+from embed import VECTOR_WIDTH, encode_texts
 from utils import ARTIFACTS_DIR, ensure_artifacts_dir, entry_text, iter_entries
 
-CHUNK_FAISS = "chunk.faiss"
-CHUNK_PAGES = "chunk_pages.npy"
-PAGE_VECS = "page_vecs.npy"
-PAGE_IDS = "page_ids.npy"
-PAGE_TEXTS = "page_texts.json"
-BM25_ARRAYS = "bm25.npz"
-BM25_VOCAB = "bm25_vocab.json"
-META = "meta.json"
+faiss.omp_set_num_threads(1)  # keep faiss off the threads torch/OpenMP also use
 
-PAGE_WORD_CAP = 400          # words kept per page for the page channel + CE input
-CHUNK_PQ_M = 96              # bytes/vector for the PQ chunk index (~42 MB; no LFS)
-BM25_K1, BM25_B = 1.5, 0.75  # standard BM25 saturation / length-normalization
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# ---- artifact file names (our schema) ---------------------------------------
+F_PASSAGE_INDEX = "chunk.faiss"
+F_PASSAGE_OWNER = "chunk_pages.npy"
+F_PAGE_MATRIX = "page_vecs.npy"
+F_PAGE_IDS = "page_ids.npy"
+F_PAGE_TEXT = "page_texts.json"
+F_LEX_POSTINGS = "bm25.npz"
+F_LEX_VOCAB = "bm25_vocab.json"
+F_META = "meta.json"
 
+PQ_CODE_BYTES = 96           # PQ subquantizers -> ~PQ_CODE_BYTES bytes per vector
+PAGE_TEXT_WORDS = 400        # words retained per page for the page/rerank signals
+BM25_K1, BM25_B = 1.5, 0.75
 
-def tokenize(text: str) -> List[str]:
-    """Lowercase alphanumeric tokens; shared by the BM25 build and query time."""
-    return _TOKEN_RE.findall(text.lower())
-
-
-def page_text(record: Dict) -> str:
-    """Title+content for a page, capped at PAGE_WORD_CAP words."""
-    return " ".join(entry_text(record).split()[:PAGE_WORD_CAP])
+_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
-def _write_faiss(index: faiss.Index, path: Path) -> None:
-    Path(path).write_bytes(faiss.serialize_index(index).tobytes())
+def term_tokens(text: str) -> List[str]:
+    """Lowercase alphanumeric tokenization shared by the BM25 build and queries."""
+    return _WORD_RE.findall(text.lower())
 
 
-def _read_faiss(path: Path) -> faiss.Index:
-    raw = np.frombuffer(Path(path).read_bytes(), dtype=np.uint8).copy()
-    return faiss.deserialize_index(raw)
+def capped_page_text(record: Dict) -> str:
+    """Title+body of a page, trimmed to PAGE_TEXT_WORDS words."""
+    return " ".join(entry_text(record).split()[:PAGE_TEXT_WORDS])
 
 
-def build_bm25(token_lists: List[List[str]]) -> Tuple[Dict[str, int], Dict[str, np.ndarray]]:
-    """Page-level BM25 stored CSR-by-term, with each posting's weight precomputed.
+# ---- in-memory view of the artifacts ----------------------------------------
+@dataclass
+class CorpusIndex:
+    page_ids: List[int]
+    page_matrix: np.ndarray          # (num_pages, dim), unit-norm float32
+    page_text: List[str]             # rerank input, aligned to page_ids
+    vocab: Dict[str, int]
+    lex_ptr: np.ndarray              # CSR row pointer over terms
+    lex_pages: np.ndarray            # posting page rows
+    lex_weights: np.ndarray          # posting BM25 weights
+    passages: faiss.Index            # PQ index over passage vectors
+    passage_owner: np.ndarray        # passage-row -> page_id
+    row_of: Dict[int, int] = field(init=False)
 
-    At query time scoring is then a gather + scatter-add over the postings of the
-    query terms, so no per-query BM25 arithmetic is needed.
+    def __post_init__(self) -> None:
+        self.row_of = {pid: i for i, pid in enumerate(self.page_ids)}
+
+
+def _build_lexical(token_docs: List[List[str]]):
+    """Return (vocab, ptr, pages, weights): a per-term CSR of BM25 posting weights.
+
+    Each posting's weight already folds in IDF and length normalization, so query
+    scoring is just a sum of the relevant postings.
     """
-    n_pages = len(token_lists)
-    doc_len = np.array([len(t) for t in token_lists], dtype=np.float64)
-    avgdl = float(doc_len.mean()) if n_pages else 0.0
+    n_docs = len(token_docs)
+    lengths = np.fromiter((len(d) for d in token_docs), dtype=np.float64, count=n_docs)
+    mean_len = float(lengths.mean()) if n_docs else 0.0
 
     vocab: Dict[str, int] = {}
-    tf_per_page: List[Dict[int, int]] = []
-    df: Dict[int, int] = {}
-    for toks in token_lists:
-        tf: Dict[int, int] = {}
-        for w in toks:
-            tid = vocab.setdefault(w, len(vocab))
-            tf[tid] = tf.get(tid, 0) + 1
-        tf_per_page.append(tf)
-        for tid in tf:
-            df[tid] = df.get(tid, 0) + 1
+    doc_terms: List[Dict[int, int]] = []
+    seen_in: List[int] = []                       # document frequency per term id
+    for tokens in token_docs:
+        counts: Dict[int, int] = {}
+        for tok in tokens:
+            tid = vocab.get(tok)
+            if tid is None:
+                tid = vocab[tok] = len(vocab)
+                seen_in.append(0)
+            counts[tid] = counts.get(tid, 0) + 1
+        doc_terms.append(counts)
+        for tid in counts:
+            seen_in[tid] += 1
 
-    idf = np.zeros(len(vocab), dtype=np.float64)
-    for tid, d in df.items():
-        idf[tid] = math.log((n_pages - d + 0.5) / (d + 0.5) + 1.0)
+    df = np.asarray(seen_in, dtype=np.float64)
+    idf = np.log1p((n_docs - df + 0.5) / (df + 0.5))
 
-    postings: List[List[Tuple[int, float]]] = [[] for _ in range(len(vocab))]
-    for page, tf in enumerate(tf_per_page):
-        denom_norm = 1.0 - BM25_B + BM25_B * (doc_len[page] / avgdl if avgdl else 0.0)
-        for tid, f in tf.items():
-            weight = idf[tid] * (f * (BM25_K1 + 1.0)) / (f + BM25_K1 * denom_norm)
-            postings[tid].append((page, weight))
+    # collect postings grouped by term so the CSR layout is term-major
+    grouped: List[List[tuple]] = [[] for _ in range(len(vocab))]
+    for doc, counts in enumerate(doc_terms):
+        norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (lengths[doc] / mean_len if mean_len else 0.0))
+        for tid, tf in counts.items():
+            weight = idf[tid] * tf * (BM25_K1 + 1.0) / (tf + norm)
+            grouped[tid].append((doc, weight))
 
-    term_ptr = np.zeros(len(vocab) + 1, dtype=np.int64)
-    post_pages: List[int] = []
-    post_weights: List[float] = []
-    for tid, plist in enumerate(postings):
-        for page, w in plist:
-            post_pages.append(page)
-            post_weights.append(w)
-        term_ptr[tid + 1] = len(post_pages)
+    ptr = np.zeros(len(vocab) + 1, dtype=np.int64)
+    pages: List[int] = []
+    weights: List[float] = []
+    for tid, postings in enumerate(grouped):
+        for doc, weight in postings:
+            pages.append(doc)
+            weights.append(weight)
+        ptr[tid + 1] = len(pages)
 
-    arrays = {
-        "term_ptr": term_ptr,
-        "post_pages": np.asarray(post_pages, dtype=np.int32),
-        "post_weights": np.asarray(post_weights, dtype=np.float32),
-    }
-    return vocab, arrays
+    return (vocab, ptr,
+            np.asarray(pages, dtype=np.int32),
+            np.asarray(weights, dtype=np.float32))
 
 
 def build_index(*, entries_dir: Optional[Path] = None,
                 artifacts_dir: Optional[Path] = None) -> None:
-    """Build and persist every retrieval artifact from the corpus."""
+    """Build every artifact from the corpus and persist it under ``artifacts/``."""
     out = artifacts_dir or ensure_artifacts_dir()
-    records = list(iter_entries(entries_dir))
-    print(f"[build] {len(records)} pages")
+    pages = list(iter_entries(entries_dir))
+    print(f"[build] {len(pages)} pages", flush=True)
 
-    # ---- chunk channel: dense FAISS over overlapping windows -----------------
-    chunks: List[Chunk] = chunk_corpus(records)
-    print(f"[build] {len(chunks)} chunks; embedding...", flush=True)
-    chunk_vecs = embed_texts([c.text for c in chunks], progress_every=20000)
-    dim = int(chunk_vecs.shape[1]) if chunk_vecs.size else EMBED_DIM
-    # Product-quantized index (METRIC_INNER_PRODUCT == cosine on unit vectors):
-    # compresses 437k x 384 floats from ~672 MB to ~42 MB with no measurable
-    # recall loss, keeping every artifact under GitHub's 100 MB limit (no LFS).
-    chunk_index = faiss.IndexPQ(dim, CHUNK_PQ_M, 8, faiss.METRIC_INNER_PRODUCT)
-    if chunk_vecs.size:
-        chunk_index.train(chunk_vecs)
-        chunk_index.add(chunk_vecs)
-    _write_faiss(chunk_index, out / CHUNK_FAISS)
-    np.save(out / CHUNK_PAGES, np.array([c.page_id for c in chunks], dtype=np.int32))
+    # passage signal: PQ-compressed FAISS over sliding windows
+    passages: List[Passage] = passages_of(pages)
+    print(f"[build] {len(passages)} passages; encoding", flush=True)
+    pvecs = encode_texts([p.text for p in passages], report_every=20000)
+    dim = int(pvecs.shape[1]) if pvecs.size else VECTOR_WIDTH
+    pq = faiss.IndexPQ(dim, PQ_CODE_BYTES, 8, faiss.METRIC_INNER_PRODUCT)
+    if pvecs.size:
+        pq.train(pvecs)
+        pq.add(pvecs)
+    faiss.write_index(pq, str(out / F_PASSAGE_INDEX))
+    np.save(out / F_PASSAGE_OWNER, np.fromiter((p.page_id for p in passages),
+                                               dtype=np.int32, count=len(passages)))
 
-    # ---- page channel: one dense vector + capped text per page ---------------
-    page_ids = [int(r["page_id"]) for r in records]
-    page_texts = [page_text(r) for r in records]
-    print("[build] embedding pages...")
-    page_vecs = embed_texts(page_texts)
-    if page_vecs.size == 0:
-        page_vecs = np.zeros((0, dim), dtype=np.float32)
-    np.save(out / PAGE_VECS, page_vecs.astype(np.float32))
-    np.save(out / PAGE_IDS, np.array(page_ids, dtype=np.int64))
-    (out / PAGE_TEXTS).write_text(json.dumps(page_texts), encoding="utf-8")
+    # page signal: one vector + capped text per page
+    page_ids = [int(r["page_id"]) for r in pages]
+    page_text = [capped_page_text(r) for r in pages]
+    print("[build] encoding pages", flush=True)
+    page_matrix = encode_texts(page_text)
+    if page_matrix.size == 0:
+        page_matrix = np.zeros((0, dim), dtype=np.float32)
+    np.save(out / F_PAGE_MATRIX, page_matrix.astype(np.float32))
+    np.save(out / F_PAGE_IDS, np.asarray(page_ids, dtype=np.int64))
+    (out / F_PAGE_TEXT).write_text(json.dumps(page_text), encoding="utf-8")
 
-    # ---- lexical channel: page-level BM25 -----------------------------------
-    print("[build] building BM25...")
-    vocab, bm = build_bm25([tokenize(t) for t in page_texts])
-    np.savez(out / BM25_ARRAYS, **bm)
-    (out / BM25_VOCAB).write_text(json.dumps(vocab), encoding="utf-8")
+    # lexical signal: page-level BM25
+    print("[build] building BM25", flush=True)
+    vocab, ptr, post_pages, post_weights = _build_lexical([term_tokens(t) for t in page_text])
+    np.savez(out / F_LEX_POSTINGS, term_ptr=ptr, post_pages=post_pages, post_weights=post_weights)
+    (out / F_LEX_VOCAB).write_text(json.dumps(vocab), encoding="utf-8")
 
-    (out / META).write_text(json.dumps({
+    (out / F_META).write_text(json.dumps({
         "model": "sentence-transformers/all-MiniLM-L6-v2",
         "dim": dim,
-        "num_pages": len(page_ids),
-        "num_chunks": len(chunks),
-        "vocab_size": len(vocab),
+        "pages": len(page_ids),
+        "passages": len(passages),
+        "vocab": len(vocab),
+        "pq_bytes": PQ_CODE_BYTES,
     }, indent=2), encoding="utf-8")
-    print(f"[build] done -> {out}")
+    print(f"[build] artifacts written to {out}", flush=True)
 
 
-def load_chunk_index(artifacts_dir: Optional[Path] = None) -> Tuple[faiss.Index, np.ndarray]:
-    """Load the chunk FAISS index and its chunk-row -> page_id array."""
+def load_index(artifacts_dir: Optional[Path] = None) -> CorpusIndex:
+    """Load every artifact into a :class:`CorpusIndex`."""
     root = artifacts_dir or ARTIFACTS_DIR
-    return _read_faiss(root / CHUNK_FAISS), np.load(root / CHUNK_PAGES)
-
-
-def load_hybrid(artifacts_dir: Optional[Path] = None) -> Dict:
-    """Load the page vectors, page-level BM25, ids, and page texts for retrieval."""
-    root = artifacts_dir or ARTIFACTS_DIR
-    bm = np.load(root / BM25_ARRAYS)
-    return {
-        "page_vecs": np.ascontiguousarray(np.load(root / PAGE_VECS), dtype=np.float32),
-        "page_ids": [int(x) for x in np.load(root / PAGE_IDS)],
-        "page_texts": json.loads((root / PAGE_TEXTS).read_text(encoding="utf-8")),
-        "vocab": json.loads((root / BM25_VOCAB).read_text(encoding="utf-8")),
-        "term_ptr": bm["term_ptr"],
-        "post_pages": bm["post_pages"],
-        "post_weights": bm["post_weights"],
-    }
+    postings = np.load(root / F_LEX_POSTINGS)
+    return CorpusIndex(
+        page_ids=[int(x) for x in np.load(root / F_PAGE_IDS)],
+        page_matrix=np.ascontiguousarray(np.load(root / F_PAGE_MATRIX), dtype=np.float32),
+        page_text=json.loads((root / F_PAGE_TEXT).read_text(encoding="utf-8")),
+        vocab=json.loads((root / F_LEX_VOCAB).read_text(encoding="utf-8")),
+        lex_ptr=postings["term_ptr"],
+        lex_pages=postings["post_pages"],
+        lex_weights=postings["post_weights"],
+        passages=faiss.read_index(str(root / F_PASSAGE_INDEX)),
+        passage_owner=np.load(root / F_PASSAGE_OWNER),
+    )

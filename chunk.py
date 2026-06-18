@@ -1,68 +1,65 @@
-"""Corpus preprocessing and chunking.
+"""Turn corpus pages into the passage units we actually index.
 
-A whole Wikipedia page is often too long for a 256-token encoder, so a single
-page embedding blurs many topics together. We instead split each page into
-overlapping word windows and embed those; at query time the page inherits the
-score of its best-matching window (max-pool). The page title is prepended to
-every window so each unit still names the entity it describes.
-
-`TARGET_WORDS` / `OVERLAP_WORDS` are the knobs we sweep offline; see the README
-for the chosen values and their NDCG@10 effect.
+A single embedding for a long article averages many unrelated topics together,
+which hides the one paragraph a query cares about. We therefore slide a fixed-size
+word window across each page and emit one passage per window, repeating the page
+title at the start of every window so the entity name travels with the text. Short
+pages stay as a single passage. The window/stride pair below was chosen by the
+offline evaluation.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 from utils import entry_text
 
-TARGET_WORDS = 180       # words per window (before the title prefix)
-OVERLAP_WORDS = 40       # words shared between consecutive windows
+WINDOW_WORDS = 180       # words per passage window
+STRIDE_BACK = 40         # words shared with the previous window (overlap)
 
-_SENT_RE = re.compile(r"(?<=[.!?])\s+")
+_WS = re.compile(r"\s+")
 
 
 @dataclass
-class Chunk:
-    """One retrieval unit and the page it belongs to."""
+class Passage:
+    """A single indexed unit and a back-pointer to the page it came from."""
     page_id: int
-    chunk_id: int
+    ordinal: int
     text: str
 
 
-def _windows(words: List[str], size: int, overlap: int) -> List[str]:
-    """Slide a `size`-word window over `words`, stepping by `size - overlap`."""
-    if not words:
-        return []
-    step = max(1, size - overlap)
-    out: List[str] = []
-    for start in range(0, len(words), step):
-        out.append(" ".join(words[start:start + size]))
-        if start + size >= len(words):
-            break
-    return out
+def _sliding(words: List[str]) -> Iterable[str]:
+    """Yield successive WINDOW_WORDS slices advancing by (WINDOW_WORDS - STRIDE_BACK)."""
+    advance = max(1, WINDOW_WORDS - STRIDE_BACK)
+    cursor = 0
+    n = len(words)
+    while cursor < n:
+        yield " ".join(words[cursor:cursor + WINDOW_WORDS])
+        if cursor + WINDOW_WORDS >= n:
+            return
+        cursor += advance
 
 
-def chunk_entry(record: Dict[str, Any]) -> List[Chunk]:
-    """Split one page into title-prefixed, overlapping word windows."""
+def split_page(record: Dict[str, Any]) -> List[Passage]:
+    """Break one page record into one or more title-led passages."""
     page_id = int(record["page_id"])
-    title = str(record.get("title", "")).strip()
-    body = entry_text(record)
-    words = body.split()
+    full = entry_text(record)
+    words = _WS.sub(" ", full).split()
 
-    if len(words) <= TARGET_WORDS:
-        texts = [body] if body else [title]
+    if len(words) <= WINDOW_WORDS:
+        bodies = [full] if full else [str(record.get("title", "")).strip()]
     else:
-        prefix = f"{title}\n\n" if title else ""
-        texts = [f"{prefix}{w}".strip() for w in _windows(words, TARGET_WORDS, OVERLAP_WORDS)]
+        head = str(record.get("title", "")).strip()
+        lead = f"{head}\n\n" if head else ""
+        bodies = [f"{lead}{window}".strip() for window in _sliding(words)]
 
-    return [Chunk(page_id=page_id, chunk_id=i, text=t) for i, t in enumerate(texts)]
+    return [Passage(page_id=page_id, ordinal=i, text=body) for i, body in enumerate(bodies)]
 
 
-def chunk_corpus(records: List[Dict[str, Any]]) -> List[Chunk]:
-    """Flatten every record into a single list of chunks."""
-    chunks: List[Chunk] = []
+def passages_of(records: Iterable[Dict[str, Any]]) -> List[Passage]:
+    """Flatten an iterable of page records into one passage list."""
+    out: List[Passage] = []
     for record in records:
-        chunks.extend(chunk_entry(record))
-    return chunks
+        out.extend(split_page(record))
+    return out

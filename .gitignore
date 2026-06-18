@@ -9,3 +9,6 @@ artifacts-dev/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Video figures (kept locally; not part of the graded pipeline)
+figures/

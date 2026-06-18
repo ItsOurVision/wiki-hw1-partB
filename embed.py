@@ -1,74 +1,79 @@
-"""Dense text encoder.
+"""Dense text encoder built on the mandated MiniLM sentence model.
 
-All retrieval embeddings come from `sentence-transformers/all-MiniLM-L6-v2`
-(384-d). Vectors are L2-normalized so that an inner product equals cosine
-similarity, which lets the FAISS `IndexFlatIP` and the page-vector matmul share
-one similarity definition.
+Every vector in the system — corpus pages, passages, and incoming queries — is
+produced here so they all live in the same 384-dimensional space. Vectors are
+returned unit-normalized; with unit vectors a plain dot product already equals
+cosine similarity, which keeps the FAISS index and the page-matrix scoring on one
+common scale.
 """
 from __future__ import annotations
 
 import time
 from typing import List, Sequence
 
-import runtime  # noqa: F401  # sets OpenMP guard before torch loads
+import runtime  # noqa: F401  - installs the OpenMP guard before torch is imported
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from utils import EMBEDDING_MODEL_NAME
 
-EMBED_DIM = 384          # all-MiniLM-L6-v2 output width
-MAX_SEQ_LENGTH = 256     # tokens; the encoder truncates past this
+VECTOR_WIDTH = 384       # MiniLM-L6 hidden size
+TOKEN_BUDGET = 256       # the encoder truncates anything longer
 
-_MODEL: SentenceTransformer | None = None
-
-
-def get_model() -> SentenceTransformer:
-    """Load the encoder once and reuse it (picks GPU/MPS automatically)."""
-    global _MODEL
-    if _MODEL is None:
-        _MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        _MODEL.max_seq_length = MAX_SEQ_LENGTH
-    return _MODEL
+_encoder: SentenceTransformer | None = None
 
 
-def embed_texts(texts: Sequence[str], *, batch_size: int = 128,
-                progress_every: int = 0) -> np.ndarray:
-    """Encode `texts` into L2-normalized float32 rows, shape (len(texts), 384).
+def encoder() -> SentenceTransformer:
+    """Return the shared encoder, constructing it on first use (GPU/MPS aware)."""
+    global _encoder
+    if _encoder is None:
+        model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        model.max_seq_length = TOKEN_BUDGET
+        _encoder = model
+    return _encoder
 
-    Set `progress_every` > 0 to print an offline build rate/ETA every N rows
-    (used by the index build; the query path leaves it at 0 for silence).
+
+def _encode_block(block: List[str], batch: int) -> np.ndarray:
+    return encoder().encode(
+        block,
+        batch_size=batch,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+
+
+def encode_texts(texts: Sequence[str], *, batch: int = 128, report_every: int = 0) -> np.ndarray:
+    """Encode `texts` to unit-norm float32 rows of shape (len(texts), 384).
+
+    `report_every > 0` prints a throughput/ETA line every N rows; the offline
+    build turns this on, while the timed query path leaves it silent.
     """
-    n = len(texts)
-    if n == 0:
-        return np.zeros((0, EMBED_DIM), dtype=np.float32)
-    model = get_model()
-    if progress_every <= 0:
-        vectors = model.encode(
-            list(texts), batch_size=batch_size, convert_to_numpy=True,
-            normalize_embeddings=True, show_progress_bar=False,
-        )
-        return np.ascontiguousarray(vectors, dtype=np.float32)
+    count = len(texts)
+    if count == 0:
+        return np.zeros((0, VECTOR_WIDTH), dtype=np.float32)
 
-    out = np.empty((n, EMBED_DIM), dtype=np.float32)
-    start = time.time()
-    done = 0
-    next_mark = progress_every
-    for i in range(0, n, batch_size):
-        block = list(texts[i:i + batch_size])
-        out[i:i + len(block)] = model.encode(
-            block, batch_size=batch_size, convert_to_numpy=True,
-            normalize_embeddings=True, show_progress_bar=False,
-        )
-        done += len(block)
-        if done >= next_mark or done == n:
-            rate = done / max(1e-9, time.time() - start)
-            eta = (n - done) / max(1e-9, rate)
-            print(f"      [embed] {done:,}/{n:,} ({100*done/n:.0f}%) | "
-                  f"{rate:.0f} ch/s | ETA ~{eta/60:.1f}m", flush=True)
-            next_mark += progress_every
-    return out
+    if report_every <= 0:
+        return np.ascontiguousarray(_encode_block(list(texts), batch), dtype=np.float32)
+
+    matrix = np.empty((count, VECTOR_WIDTH), dtype=np.float32)
+    started = time.time()
+    milestone = report_every
+    filled = 0
+    while filled < count:
+        block = list(texts[filled:filled + batch])
+        matrix[filled:filled + len(block)] = _encode_block(block, batch)
+        filled += len(block)
+        if filled >= milestone or filled == count:
+            speed = filled / max(1e-9, time.time() - started)
+            remaining = (count - filled) / max(1e-9, speed)
+            print(f"      embedded {filled:,}/{count:,} "
+                  f"({100 * filled / count:.0f}%)  {speed:.0f}/s  eta {remaining / 60:.1f}m",
+                  flush=True)
+            milestone += report_every
+    return matrix
 
 
-def embed_queries(queries: List[str], *, batch_size: int = 128) -> np.ndarray:
-    """Encode a batch of query strings (same space as the corpus vectors)."""
-    return embed_texts(queries, batch_size=batch_size)
+def encode_queries(queries: List[str], *, batch: int = 128) -> np.ndarray:
+    """Encode a batch of query strings into the shared embedding space."""
+    return encode_texts(queries, batch=batch)
