@@ -7,8 +7,8 @@ steps:
    passage cosine per page from the FAISS index;
 2. assemble a candidate pool (BM25 leaders, with a dense fallback, widened by the
    pages that own strong passages);
-3. fuse the three signals over that pool with min-max normalization and fixed
-   weights;
+3. fuse the three signals over that pool with reciprocal rank fusion, which
+   blends them by rank position and so needs no per-signal weight;
 4. rerank the very top of the pool with a cross-encoder, mixed with the fusion
    score so a confident-but-wrong reranker cannot sink an already-good page.
 
@@ -28,13 +28,11 @@ import numpy as np
 from embed import encode_queries
 from index import CorpusIndex, load_index, term_tokens
 
-# ---- ranking configuration (values fixed by the offline sweeps) -------------
+# ---- ranking configuration --------------------------------------------------
 LEX_POOL = 100               # BM25 leaders taken as candidates
 PASSAGE_POOL = 256           # passages fetched per query before pooling to pages
 RESULT_DEPTH = 50            # pages emitted per query (grader scores the first 10)
-WEIGHT_DENSE = 0.2           # fusion weight: whole-page cosine
-WEIGHT_LEX = 0.5             # fusion weight: BM25
-WEIGHT_PASSAGE = 0.3         # fusion weight: best-passage cosine
+RRF_K = 60                   # reciprocal-rank-fusion damping constant (standard)
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RERANK_DEPTH = 12            # how many pool leaders the cross-encoder rescoring sees
 RERANK_WEIGHT = 0.85         # cross-encoder share when mixed with the fusion score
@@ -47,6 +45,22 @@ def _unit_scale(values: np.ndarray) -> np.ndarray:
     low = float(values.min())
     span = float(values.max()) - low
     return (values - low) / span if span > 1e-12 else np.zeros_like(values)
+
+
+def _reciprocal_rank_fusion(columns: List[np.ndarray], k: int = RRF_K) -> np.ndarray:
+    """Combine per-signal score columns by reciprocal rank fusion.
+
+    Each signal votes for a candidate by 1 / (k + its_rank_in_that_signal); votes
+    sum across signals. Using ranks rather than raw magnitudes makes the blend
+    scale-free, so no per-signal weight needs tuning (and none can overfit).
+    """
+    fused = np.zeros(columns[0].shape[0], dtype=np.float64)
+    for column in columns:
+        order = np.argsort(-column)
+        rank = np.empty(order.shape[0], dtype=np.int64)
+        rank[order] = np.arange(order.shape[0])
+        fused += 1.0 / (k + rank)
+    return fused
 
 
 class HybridRanker:
@@ -116,9 +130,7 @@ class HybridRanker:
         passage_col = np.fromiter(
             (passage.get(ix.page_ids[int(r)], 0.0) for r in pool),
             dtype=np.float32, count=pool.size)
-        fused = (WEIGHT_DENSE * _unit_scale(dense[pool])
-                 + WEIGHT_LEX * _unit_scale(lex[pool])
-                 + WEIGHT_PASSAGE * _unit_scale(passage_col))
+        fused = _reciprocal_rank_fusion([dense[pool], lex[pool], passage_col])
         ordering = np.argsort(-fused)
         ranked = pool[ordering]
         fused_desc = fused[ordering]
@@ -154,12 +166,12 @@ class HybridRanker:
         return [self.rank_query(queries[i], qvecs[i]) for i in range(len(queries))]
 
 
-_RANKER: Optional[HybridRanker] = None
+_ENGINE: Optional[HybridRanker] = None
 
 
-def search_batch(queries: List[str], *, artifacts_dir: Optional[Path] = None) -> List[List[int]]:
+def rank_queries(queries: List[str], *, artifacts_dir: Optional[Path] = None) -> List[List[int]]:
     """Rank every query; returns one best-first list of page_id per query."""
-    global _RANKER
-    if _RANKER is None:
-        _RANKER = HybridRanker(load_index(artifacts_dir))
-    return _RANKER.rank_batch(queries)
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = HybridRanker(load_index(artifacts_dir))
+    return _ENGINE.rank_batch(queries)

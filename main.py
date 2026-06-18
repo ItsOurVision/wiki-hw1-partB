@@ -14,8 +14,8 @@ from typing import List
 
 def run(queries: List[str]) -> List[List[int]]:
     """Return a best-first ranked list of page_id for each query string."""
-    from retrieve import search_batch
-    return search_batch(queries)
+    from retrieve import rank_queries
+    return rank_queries(queries)
 
 
 def build_offline_index() -> None:

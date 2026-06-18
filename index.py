@@ -44,7 +44,8 @@ F_META = "meta.json"
 
 PQ_CODE_BYTES = 96           # PQ subquantizers -> ~PQ_CODE_BYTES bytes per vector
 PAGE_TEXT_WORDS = 400        # words retained per page for the page/rerank signals
-BM25_K1, BM25_B = 1.5, 0.75
+BM25_SATURATION = 1.5        # BM25 k1: term-frequency saturation
+BM25_LENGTH_NORM = 0.75      # BM25 b: document-length normalization strength
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
@@ -108,9 +109,10 @@ def _build_lexical(token_docs: List[List[str]]):
     # collect postings grouped by term so the CSR layout is term-major
     grouped: List[List[tuple]] = [[] for _ in range(len(vocab))]
     for doc, counts in enumerate(doc_terms):
-        norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (lengths[doc] / mean_len if mean_len else 0.0))
+        norm = BM25_SATURATION * (1.0 - BM25_LENGTH_NORM
+                                  + BM25_LENGTH_NORM * (lengths[doc] / mean_len if mean_len else 0.0))
         for tid, tf in counts.items():
-            weight = idf[tid] * tf * (BM25_K1 + 1.0) / (tf + norm)
+            weight = idf[tid] * tf * (BM25_SATURATION + 1.0) / (tf + norm)
             grouped[tid].append((doc, weight))
 
     ptr = np.zeros(len(vocab) + 1, dtype=np.int64)
