@@ -1,0 +1,7 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "dim": 384,
+  "num_pages": 27074,
+  "num_chunks": 437573,
+  "vocab_size": 170088
+}
