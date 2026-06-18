@@ -1,5 +1,7 @@
 # Section B — Wikipedia Retrieval Pipeline
 
+**Authors:** Daniel Kats (207730854) · Noga Nagel (322586082)
+
 End-to-end retrieval over ~27,000 Wikipedia-style pages. For each query,
 `run(queries)` returns a ranked list of `page_id`s, scored by mean **NDCG@10**.
 
