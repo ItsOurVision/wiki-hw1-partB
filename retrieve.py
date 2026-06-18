@@ -17,16 +17,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import runtime  # noqa: F401  # sets OpenMP guard before faiss/torch load
 import numpy as np
 
 from embed import embed_queries
 from index import load_chunk_index, load_hybrid, tokenize
 
 # --- tunable config (selected by the offline sweep; see README) --------------
-CAND_M = 60                              # BM25 candidate pages fed to fusion
+CAND_M = 100                             # BM25 candidate pages fed to fusion
 CHUNK_TOPN = 256                         # chunks pulled per query before max-pool
 RETURN_K = 50                            # pages returned (only first 10 scored)
-W_DENSE, W_BM25, W_CHUNK = 0.3, 0.5, 0.2  # linear fusion weights
+W_DENSE, W_BM25, W_CHUNK = 0.2, 0.5, 0.3  # linear fusion weights (offline sweep)
 CE_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CE_TOPK = 12                             # candidates reranked by the cross-encoder
 W_CE = 0.85                              # CE share in the rerank blend
@@ -107,7 +108,10 @@ def _chunk_page_scores(qvec: np.ndarray, artifacts_dir: Optional[Path]) -> Dict[
 
 def _rank_one(query: str, qvec: np.ndarray, h: Dict, artifacts_dir: Optional[Path]) -> List[int]:
     page_ids = h["page_ids"]
-    dense_all = h["page_vecs"] @ qvec
+    # The matmul triggers spurious FP warnings on macOS Accelerate (numpy 2.x);
+    # scores are correct, so we silence them here.
+    with np.errstate(all="ignore"):
+        dense_all = h["page_vecs"] @ qvec
     bm25_all = _bm25_scores(tokenize(query), h)
     chunk_best = _chunk_page_scores(qvec, artifacts_dir)
 

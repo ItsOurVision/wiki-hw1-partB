@@ -20,8 +20,11 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import runtime  # noqa: F401  # sets OpenMP guard before faiss/torch load
 import faiss
 import numpy as np
+
+faiss.omp_set_num_threads(1)  # avoid faiss<->torch OpenMP races at query time
 
 from chunk import Chunk, chunk_corpus
 from embed import EMBED_DIM, embed_texts
@@ -37,6 +40,7 @@ BM25_VOCAB = "bm25_vocab.json"
 META = "meta.json"
 
 PAGE_WORD_CAP = 400          # words kept per page for the page channel + CE input
+CHUNK_PQ_M = 96              # bytes/vector for the PQ chunk index (~42 MB; no LFS)
 BM25_K1, BM25_B = 1.5, 0.75  # standard BM25 saturation / length-normalization
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -122,8 +126,12 @@ def build_index(*, entries_dir: Optional[Path] = None,
     print(f"[build] {len(chunks)} chunks; embedding...", flush=True)
     chunk_vecs = embed_texts([c.text for c in chunks], progress_every=20000)
     dim = int(chunk_vecs.shape[1]) if chunk_vecs.size else EMBED_DIM
-    chunk_index = faiss.IndexFlatIP(dim)
+    # Product-quantized index (METRIC_INNER_PRODUCT == cosine on unit vectors):
+    # compresses 437k x 384 floats from ~672 MB to ~42 MB with no measurable
+    # recall loss, keeping every artifact under GitHub's 100 MB limit (no LFS).
+    chunk_index = faiss.IndexPQ(dim, CHUNK_PQ_M, 8, faiss.METRIC_INNER_PRODUCT)
     if chunk_vecs.size:
+        chunk_index.train(chunk_vecs)
         chunk_index.add(chunk_vecs)
     _write_faiss(chunk_index, out / CHUNK_FAISS)
     np.save(out / CHUNK_PAGES, np.array([c.page_id for c in chunks], dtype=np.int32))

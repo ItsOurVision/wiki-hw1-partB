@@ -49,10 +49,8 @@ def run_grid(grid: dict) -> list:
 if __name__ == "__main__":
     grid = {
         "W_BM25": [0.4, 0.5, 0.6],
-        "W_DENSE": [0.3],
-        "W_CHUNK": [0.2],
-        "CAND_M": [60, 100],
-        "CE_TOPK": [10, 15],
+        "W_DENSE": [0.2, 0.3, 0.4],
+        "W_CHUNK": [0.2, 0.3, 0.4],
     }
     res = sorted(run_grid(grid), key=lambda r: -r["ndcg"])
     (OUT / "sweep_results.json").write_text(json.dumps(res, indent=2))

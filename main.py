@@ -6,6 +6,7 @@ prebuilt artifacts from disk (see index.py / README).
 """
 from __future__ import annotations
 
+import runtime  # noqa: F401  # sets OpenMP guard before faiss/torch load
 from typing import List
 
 from index import build_index

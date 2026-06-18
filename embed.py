@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 from typing import List, Sequence
 
+import runtime  # noqa: F401  # sets OpenMP guard before torch loads
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
