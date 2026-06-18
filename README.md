@@ -99,4 +99,4 @@ index's quality at ~1/15th the size. The full query batch runs in a few seconds
 
 ## Video
 
-Presentation: _link to be added_.
+Presentation (≤ 3 min): https://youtu.be/zI6FRaDmKSE
