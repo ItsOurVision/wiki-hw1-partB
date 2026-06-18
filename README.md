@@ -122,17 +122,23 @@ far inside the 60-second budget.
 ## Files in this repo
 
 ```
-main.py            run(queries) entry point + offline build hook
-chunk.py           page → overlapping passages
-embed.py           MiniLM encoder (shared by build and query)
-index.py           build + load of the on-disk signals
-retrieve.py        the timed lookup (fusion + rerank)
-runtime.py         OpenMP guard so FAISS and torch coexist safely
-utils.py           paths and corpus/query helpers
-eval.py            NDCG@10 scoring (course file, unmodified)
-scripts/           eval_public.py, build_index.py (course files)
-artifacts/         the committed prebuilt index
+main.py       run(queries) entry point + offline build hook
+chunk.py      page -> overlapping passages
+embed.py      MiniLM encoder (shared by build and query)
+signals.py    the three signal scorers (dense / BM25 / passage) + rank fusion
+index.py      build the artifacts; load them into an IndexBundle of signals
+retrieve.py   the timed lookup: a Searcher that composes the signals
+runtime.py    OpenMP guard so FAISS and torch coexist safely
+utils.py      paths and corpus/query helpers
+eval.py       NDCG@10 scoring (course file, unmodified)
+scripts/      eval_public.py, build_index.py (course files)
+artifacts/    the committed prebuilt index
 ```
+
+The retrieval logic is organized around one scorer object per signal
+(`signals.py`): the build and the query path share the exact same scoring code,
+`index.py` assembles the scorers into a bundle, and `retrieve.py` only orchestrates
+them.
 
 ## Presentation
 
